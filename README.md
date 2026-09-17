@@ -1,12 +1,14 @@
 # Group photo failures by the work order that caused them
 
-A failed photo upload shouldn't spawn a new alert on every retry tap. That's the noisiest stream in a field-service app. The unit that matters is work order, photo stage, and exception type. This repo makes that grouping explicit, and keeps dispatch state plus the technician's follow-up on each occurrence.
+A retry storm of alerts is the worst. A technician taps retry on a failed photo upload, and your alert stream spawns a fresh issue each time. Not helpful.
 
-Infrai fits here with one endpoint for errors over plain HTTP. A single `INFRAI_API_KEY` reaches the error API; no vendor SDK sits in the request path. The route accepts a typed work-order payload and sends the exception to `POST /v1/errors/capture`.
+Better: group by work order, photo stage, and exception type. This repo makes that choice explicit. Dispatch state and the tech's follow-up stay attached to each occurrence.
+
+Infrai gives you one api for this slice. A single `INFRAI_API_KEY` reaches the error API through plain HTTP. No vendor SDK sits in the request path. The route accepts a typed work-order payload and sends the exception to `POST /v1/errors/capture`.
 
 ## The workflow I would ship
 
-Spin up the env, install deps, and run the app entry point:
+Spin up the env, install deps, and start the entry point:
 
 ```bash
 python3 -m venv .venv
@@ -16,7 +18,7 @@ export INFRAI_API_KEY="your-key-from-infrai"
 uvicorn fieldservice_errors.service:service --reload
 ```
 
-Now simulate a photo upload failure from the field backend:
+Now report a photo upload failure from the field backend:
 
 ```bash
 curl --request POST http://127.0.0.1:8000/work-orders/photo-errors \
@@ -43,31 +45,33 @@ The local response shows the grouping decision:
 }
 ```
 
-Here's the key part. `occurrence_id` tags one mobile attempt and seeds the idempotency key. Retry the same write and you won't get a second issue. A later attempt is its own event, but the stable fingerprint folds it into the same operational issue.
+`occurrence_id` tags one mobile attempt. It becomes the basis of the idempotency key. Retry that same write and a second occurrence is not created. A later attempt gets its own event, but the stable fingerprint folds it into the same operational issue.
+
+Diagram in words: attempt -> fingerprint -> issue bucket. Clean.
 
 ## ADR: group at the capture boundary
 
 **Status:** accepted.
 
-I weighed three options. Logging each occurrence was quick on hour one, but pushed grouping work onto whoever opened the alert. Grouping by exception type only? Too aggressive. Unrelated work orders sharing a network blip merged into one issue. A queue before capture added control, but also a moving part this workflow hadn't earned yet.
+I weighed three shapes. Log every occurrence: fastest first hour, but grouping left to whoever investigates. Group by exception type only: cut noise too hard, unrelated work orders with same network error merged. Put a queue before capture: more control, yet another moving part before the workflow earned it.
 
-I went with synchronous capture using `[work_order_id, photo_stage, exception_type]` as the fingerprint. Separate jobs stay separate. Repeated attempts at the same business step join up. `dispatch_status` and `technician_follow_up` survive as context instead of becoming grouping inputs. Cost: a short outbound call on the error path. The client caps that call, reads the Infrai envelope to judge success, surfaces API rejections, and backs off on rate limits. Every write ships a deterministic idempotency key.
+I chose synchronous capture with `[work_order_id, photo_stage, exception_type]` as the fingerprint. Separate jobs stay separate. Repeated attempts at the same business step join. `dispatch_status` plus `technician_follow_up` stay as context instead of grouping inputs. Trade-off is a short outbound call on the error path. The client caps that call, reads the Infrai envelope before deciding outcome, surfaces API rejections to the route, and backs off on rate limits. Each write carries a deterministic idempotency key.
 
-This took about two hours, route and boundary test included. The hard part was defining "same failure". The HTTP client stayed tiny on purpose.
+This took about two hours, route and boundary test included. The real cost was defining “same failure”. The HTTP client stayed small on purpose.
 
 ## Verify the decision
 
-The test sends two occurrences for `WO-1842`, both at `upload` with `ConnectionError`, but different occurrence IDs. Expect the same grouping fingerprint for both captures, distinct idempotency keys, and dispatch plus follow-up context intact.
+The focused test sends two occurrences for `WO-1842`, both at `upload` with `ConnectionError`, but different occurrence IDs. Expected: same grouping fingerprint for both captures, distinct idempotency keys, and preserved dispatch and follow-up context.
 
 ```bash
 python -m pytest -q
 ```
 
-We stop at the capture boundary here. A real product would wire the returned backend data into its incident view and access policy.
+This example stops at the capture boundary. A real product can wire the returned backend data to its own incident view and access policy.
 
 ## Production notes: Fieldservice Photo Error Groups
 
-That's the happy path. Production checklist, specific to Fieldservice Photo Error Groups:
+That was the happy path. Production checklist follows. The details below apply to Fieldservice Photo Error Groups.
 
 **Account & key**
 
